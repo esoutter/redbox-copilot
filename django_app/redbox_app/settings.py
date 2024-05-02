@@ -7,6 +7,8 @@ from pathlib import Path
 import environ
 
 from .hosting_environment import HostingEnvironment
+from dotenv import load_dotenv
+load_dotenv()
 
 env = environ.Env()
 
