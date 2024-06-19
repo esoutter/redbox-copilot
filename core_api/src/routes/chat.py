@@ -1,38 +1,22 @@
 import logging
-from http import HTTPStatus
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket
+from fastapi import Depends, FastAPI, WebSocket
 from fastapi.encoders import jsonable_encoder
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains.history_aware_retriever import create_history_aware_retriever
-from langchain.chains.llm import LLMChain
-from langchain.chains.qa_with_sources import load_qa_with_sources_chain
-from langchain.chains.retrieval import create_retrieval_chain
-from langchain_community.chat_models import ChatLiteLLM
-from langchain_community.embeddings import SentenceTransformerEmbeddings
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable
-from langchain_elasticsearch import ApproxRetrievalStrategy, ElasticsearchStore
+from semantic_router import RouteLayer
 
-from core_api.src.auth import get_user_uuid
-from redbox.llm.prompts.chat import (
-    CONDENSE_QUESTION_PROMPT,
-    STUFF_DOCUMENT_PROMPT,
-    WITH_SOURCES_PROMPT,
-)
-from redbox.model_db import MODEL_PATH
-from redbox.models import EmbeddingModelInfo, Settings
-from redbox.models.chat import ChatMessage, ChatRequest, ChatResponse, SourceDocument
+from core_api.src.auth import get_user_uuid, get_ws_user_uuid
+from core_api.src.runnables import map_to_chat_response
+from core_api.src.semantic_routes import get_routable_chains, get_semantic_route_layer
+from redbox.models.chain import ChainInput
+from redbox.models.chat import ChatRequest, ChatResponse, SourceDocument
 
 # === Logging ===
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger()
-
-env = Settings()
 
 
 chat_app = FastAPI(
@@ -41,7 +25,10 @@ chat_app = FastAPI(
     version="0.1.0",
     openapi_tags=[
         {"name": "chat", "description": "Chat interactions with LLM and RAG backend"},
-        {"name": "embedding", "description": "Embedding interactions with SentenceTransformer"},
+        {
+            "name": "embedding",
+            "description": "Embedding interactions with SentenceTransformer",
+        },
         {"name": "llm", "description": "LLM information and parameters"},
     ],
     docs_url="/docs",
@@ -49,184 +36,71 @@ chat_app = FastAPI(
     openapi_url="/openapi.json",
 )
 
-log.info("Loading embedding model from environment: %s", env.embedding_model)
-embedding_model = SentenceTransformerEmbeddings(model_name=env.embedding_model, cache_folder=MODEL_PATH)
-log.info("Loaded embedding model from environment: %s", env.embedding_model)
 
+async def semantic_router_to_chain(
+    chat_request: ChatRequest, user_uuid: UUID, routable_chains: dict[str, Runnable], route_layer: RouteLayer
+) -> tuple[Runnable, ChainInput]:
+    question = chat_request.message_history[-1].text
+    route = route_layer(question)
 
-def populate_embedding_model_info() -> EmbeddingModelInfo:
-    test_text = "This is a test sentence."
-    embedding = embedding_model.embed_documents([test_text])[0]
-    return EmbeddingModelInfo(
-        embedding_model=env.embedding_model,
-        vector_size=len(embedding),
+    selected_chain = routable_chains.get(route.name, routable_chains.get("retrieval"))
+    params = ChainInput(
+        question=chat_request.message_history[-1].text,
+        file_uuids=[f.uuid for f in chat_request.selected_files],
+        user_uuid=user_uuid,
+        chat_history=chat_request.message_history[:-1],
     )
-
-
-embedding_model_info = populate_embedding_model_info()
-
-
-# === LLM setup ===
-
-
-llm = ChatLiteLLM(
-    model="gpt-3.5-turbo",
-    streaming=True,
-)
-
-es = env.elasticsearch_client()
-if env.elastic.subscription_level == "basic":
-    strategy = ApproxRetrievalStrategy(hybrid=False)
-elif env.elastic.subscription_level in ["platinum", "enterprise"]:
-    strategy = ApproxRetrievalStrategy(hybrid=True)
-else:
-    message = f"Unknown Elastic subscription level {env.elastic.subscription_level}"
-    raise ValueError(message)
-
-
-vector_store = ElasticsearchStore(
-    es_connection=es,
-    index_name="redbox-data-chunk",
-    embedding=embedding_model,
-    strategy=strategy,
-    vector_query_field="embedding",
-)
-
-
-@chat_app.post("/vanilla", tags=["chat"], response_model=ChatResponse)
-def simple_chat(chat_request: ChatRequest, _user_uuid: Annotated[UUID, Depends(get_user_uuid)]) -> ChatResponse:
-    """Get a LLM response to a question history"""
-
-    if len(chat_request.message_history) < 2:
-        raise HTTPException(
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
-            detail="Chat history should include both system and user prompts",
-        )
-
-    if chat_request.message_history[0].role != "system":
-        raise HTTPException(
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
-            detail="The first entry in the chat history should be a system prompt",
-        )
-
-    if chat_request.message_history[-1].role != "user":
-        raise HTTPException(
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
-            detail="The final entry in the chat history should be a user question",
-        )
-
-    chat_prompt = ChatPromptTemplate.from_messages((msg.role, msg.text) for msg in chat_request.message_history)
-    # Convert to LangChain style messages
-    messages = chat_prompt.format_messages()
-
-    response = llm(messages)
-
-    return ChatResponse(response_message=ChatMessage(text=response.text, role="ai"))
+    return (selected_chain, params)
 
 
 @chat_app.post("/rag", tags=["chat"])
-def rag_chat(chat_request: ChatRequest, user_uuid: Annotated[UUID, Depends(get_user_uuid)]) -> ChatResponse:
-    """Get a LLM response to a question history and file
-
-    Args:
-
-
-    Returns:
-        StreamingResponse: a stream of the chain response
-    """
-    question = chat_request.message_history[-1].text
-    previous_history = list(chat_request.message_history[:-1])
-    previous_history = ChatPromptTemplate.from_messages(
-        (msg.role, msg.text) for msg in previous_history
-    ).format_messages()
-
-    docs_with_sources_chain = load_qa_with_sources_chain(
-        llm,
-        chain_type="stuff",
-        prompt=WITH_SOURCES_PROMPT,
-        document_prompt=STUFF_DOCUMENT_PROMPT,
-        verbose=True,
-    )
-
-    condense_question_chain = LLMChain(llm=llm, prompt=CONDENSE_QUESTION_PROMPT)
-
-    standalone_question = condense_question_chain({"question": question, "chat_history": previous_history})["text"]
-
-    docs = vector_store.as_retriever(
-        search_kwargs={"filter": {"term": {"creator_user_uuid.keyword": str(user_uuid)}}}
-    ).get_relevant_documents(standalone_question)
-
-    result = docs_with_sources_chain(
-        {
-            "question": standalone_question,
-            "input_documents": docs,
-        },
-    )
-
-    source_documents = [
-        SourceDocument(
-            page_content=langchain_document.page_content,
-            file_uuid=langchain_document.metadata.get("parent_doc_uuid"),
-            page_numbers=langchain_document.metadata.get("page_numbers"),
-        )
-        for langchain_document in result.get("input_documents", [])
-    ]
-    return ChatResponse(output_text=result["output_text"], source_documents=source_documents)
+async def rag_chat(
+    chat_request: ChatRequest,
+    user_uuid: Annotated[UUID, Depends(get_user_uuid)],
+    routable_chains: Annotated[dict[str, Runnable], Depends(get_routable_chains)],
+    route_layer: Annotated[RouteLayer, Depends(get_semantic_route_layer)],
+) -> ChatResponse:
+    """REST endpoint. Get a LLM response to a question history and file."""
+    selected_chain, params = await semantic_router_to_chain(chat_request, user_uuid, routable_chains, route_layer)
+    return (selected_chain | map_to_chat_response).invoke(params.model_dump())
 
 
 @chat_app.websocket("/rag")
-async def rag_chat_streamed(websocket: WebSocket):
+async def rag_chat_streamed(
+    websocket: WebSocket,
+    routable_chains: Annotated[dict[str, Runnable], Depends(get_routable_chains)],
+    route_layer: Annotated[RouteLayer, Depends(get_semantic_route_layer)],
+):
+    """Websocket. Get a LLM response to a question history and file."""
     await websocket.accept()
 
-    retrieval_chain = await build_retrieval_chain()
+    user_uuid = await get_ws_user_uuid(websocket)
 
-    chat_request = ChatRequest.parse_raw(await websocket.receive_text())
-    chat_history = [
-        HumanMessage(content=x.text) if x.role == "user" else AIMessage(content=x.text)
-        for x in chat_request.message_history[:-1]
-    ]
-    chat = {"chat_history": chat_history, "input": chat_request.message_history[-1].text}
-    async for event in retrieval_chain.astream_events(chat, version="v1"):
-        kind = event["event"]
-        if kind == "on_chat_model_stream":
-            await websocket.send_json({"resource_type": "text", "data": event["data"]["chunk"].content})
-        elif kind == "on_chat_model_end":
-            await websocket.send_json({"resource_type": "end"})
-        elif kind == "on_retriever_end":
-            source_documents = [
-                jsonable_encoder(
-                    SourceDocument(
-                        page_content=document.page_content,
-                        file_uuid=document.metadata.get("parent_doc_uuid"),
-                        page_numbers=document.metadata.get("page_numbers"),
-                    )
+    request = await websocket.receive_text()
+    chat_request = ChatRequest.model_validate_json(request)
+
+    selected_chain, params = await semantic_router_to_chain(chat_request, user_uuid, routable_chains, route_layer)
+
+    async for event in selected_chain.astream(params.model_dump()):
+        response = event.get("response", "")
+        source_chunks = event.get("source_documents", [])
+        source_documents = [
+            jsonable_encoder(
+                SourceDocument(
+                    page_content=chunk.text,
+                    file_uuid=chunk.parent_file_uuid,
+                    page_numbers=chunk.metadata.page_number
+                    if isinstance(chunk.metadata.page_number, list)
+                    else [chunk.metadata.page_number]
+                    if chunk.metadata.page_number
+                    else [],
                 )
-                for document in event["data"]["output"]["documents"]
-            ]
+            )
+            for chunk in source_chunks
+        ]
+        if response:
+            await websocket.send_json({"resource_type": "text", "data": response})
+        if source_documents:
             await websocket.send_json({"resource_type": "documents", "data": source_documents})
-
+    await websocket.send_json({"resource_type": "end"})
     await websocket.close()
-
-
-async def build_retrieval_chain() -> Runnable:
-    prompt_search_query = ChatPromptTemplate.from_messages(
-        [
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("user", "{input}"),
-            (
-                "user",
-                "Given the above conversation, generate a search query to look up to get information relevant to the "
-                "conversation",
-            ),
-        ]
-    )
-    retriever_chain = create_history_aware_retriever(llm, vector_store.as_retriever(), prompt_search_query)
-    prompt_get_answer = ChatPromptTemplate.from_messages(
-        [
-            ("system", "Answer the user's questions based on the below context:\\n\\n{context}"),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("user", "{input}"),
-        ]
-    )
-    document_chain = create_stuff_documents_chain(llm, prompt_get_answer)
-    return create_retrieval_chain(retriever_chain, document_chain)

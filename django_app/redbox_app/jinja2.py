@@ -38,7 +38,18 @@ def markdown(text, cls=None):
     return html.replace("<p>", f'<p class="{cls or ""}">', 1).replace("</p>", "", 1)
 
 
-def humanize_timedelta(minutes=0, hours_limit=200, too_large_msg=""):
+def humanise_expiry(delta: datetime.timedelta) -> str:
+    if delta.total_seconds() > 0:
+        return f"In {humanize.naturaldelta(delta)}"
+    else:
+        return f"{humanize.naturaldelta(delta)} ago"
+
+
+def humanize_timedelta(delta: datetime.timedelta):
+    return humanize.naturaldelta(delta)
+
+
+def humanize_short_timedelta(minutes=0, hours_limit=200, too_large_msg=""):
     if minutes > (hours_limit * 60):
         if not too_large_msg:
             return f"More than {hours_limit} hours"
@@ -58,7 +69,7 @@ def to_user_timezone(value):
 
 def environment(**options):
     extra_options = {}
-    env = jinja2.Environment(  # nosec B701 # noqa S701
+    env = jinja2.Environment(  # nosec: B701 # noqa: S701
         **{
             "autoescape": True,
             "extensions": [CompressorExtension],
@@ -70,10 +81,10 @@ def environment(**options):
         {
             "static": static,
             "url": url,
-            "humanize_timedelta": humanize_timedelta,
+            "humanise_expiry": humanise_expiry,
             "template_localtime": template_localtime,
             "to_user_timezone": to_user_timezone,
-            "environment": settings.ENVIRONMENT,
+            "environment": settings.ENVIRONMENT.value,
             "security": settings.MAX_SECURITY_CLASSIFICATION.value,
         }
     )
@@ -81,10 +92,10 @@ def environment(**options):
         {
             "static": static,
             "url": url,
-            "humanize_timedelta": humanize_timedelta,
+            "humanise_expiry": humanise_expiry,
             "template_localtime": template_localtime,
             "to_user_timezone": to_user_timezone,
-            "environment": settings.ENVIRONMENT,
+            "environment": settings.ENVIRONMENT.value,
             "security": settings.MAX_SECURITY_CLASSIFICATION.value,
         }
     )
