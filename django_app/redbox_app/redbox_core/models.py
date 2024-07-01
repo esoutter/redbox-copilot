@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -10,6 +11,8 @@ from django.utils.translation import gettext_lazy as _
 from django_use_email_as_username.models import BaseUser, BaseUserManager
 from jose import jwt
 from yarl import URL
+
+logger = logging.getLogger(__name__)
 
 
 class UUIDPrimaryKeyBase(models.Model):
@@ -155,7 +158,7 @@ class File(UUIDPrimaryKeyBase, TimeStampedModel):
         return name.split(".")[-1]
 
     @property
-    def url(self) -> URL:
+    def url(self) -> URL | None:
         #  In dev environment, get pre-signed url from minio
         if settings.ENVIRONMENT.uses_minio:
             s3 = boto3.client(
@@ -175,8 +178,12 @@ class File(UUIDPrimaryKeyBase, TimeStampedModel):
                 },
             )
             return URL(url)
-        else:
-            return URL(self.original_file.url)
+
+        if not self.original_file:
+            logger.error("attempt to access not existent file %s", self.pk)
+            return None
+
+        return URL(self.original_file.url)
 
     @property
     def name(self) -> str:
@@ -220,17 +227,28 @@ class ChatRoleEnum(models.TextChoices):
     system = "system"
 
 
+class Citation(UUIDPrimaryKeyBase, TimeStampedModel):
+    file = models.ForeignKey(File, on_delete=models.CASCADE)
+    chat_message = models.ForeignKey("ChatMessage", on_delete=models.CASCADE)
+    text = models.TextField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.file}: {self.text or ''}"
+
+
 class ChatMessage(UUIDPrimaryKeyBase, TimeStampedModel):
     chat_history = models.ForeignKey(ChatHistory, on_delete=models.CASCADE)
     text = models.TextField(max_length=32768, null=False, blank=False)
     role = models.CharField(choices=ChatRoleEnum.choices, null=False, blank=False)
     route = models.CharField(max_length=25, null=True, blank=True)
-    source_files = models.ManyToManyField(
+    old_source_files = models.ManyToManyField(  # TODO (@gecBurton): delete me
+        # https://technologyprogramme.atlassian.net/browse/REDBOX-367
         File,
         related_name="chat_messages",
         blank=True,
     )
     selected_files = models.ManyToManyField(File, related_name="+", symmetrical=False, blank=True)
+    source_files = models.ManyToManyField(File, through=Citation)
 
     def __str__(self) -> str:  # pragma: no cover
-        return f"{self.chat_history} - {self.text} - {self.role}"
+        return f"{self.text} - {self.role}"
