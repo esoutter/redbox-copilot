@@ -64,16 +64,11 @@ class SourceDocuments(BaseModel):
 
 
 class ChatRoute(StrEnum):
-    info = "info"
-    ability = "ability"
-    coach = "coach"
-    gratitude = "gratitude"
     search = "search"
-    summarise = "summarise"
-    stuff_summarise = "summarise/small_document"
-    map_reduce_summarise = "summarise/large_document"
-    extract = "extract"
     chat = "chat"
+    chat_with_docs = "chat/documents"
+    chat_with_docs_map_reduce = "chat/documents/large"
+    error_no_keyword = "error/no-keyword"
 
 
 class ChatResponse(BaseModel):
@@ -85,3 +80,14 @@ class ChatResponse(BaseModel):
         examples=["The current Prime Minister of the UK is The Rt Hon. Rishi Sunak MP."],
     )
     route_name: ChatRoute = Field(description="the conversation route taken")
+
+
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+
+
+class ClientResponse(BaseModel):
+    # Needs to match CoreChatResponse in django_app/redbox_app/redbox_core/consumers.py
+    resource_type: Literal["text", "documents", "route_name", "end", "error"]
+    data: list[SourceDocument] | str | ErrorDetail | None = None

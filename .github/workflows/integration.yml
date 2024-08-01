@@ -3,13 +3,16 @@
 
 name: Integration Tests
 
+env:
+  ENVIRONMENT: INTEGRATION
+
 on:
   # weekday mealtimes
   schedule:
     - cron: '0 6,12,18 * * 1-5'
   # or on-demand
   workflow_dispatch:
- # or on push to main
+  # or on push to main
   push:
     branches:
       - 'main'
@@ -23,7 +26,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.COMMIT_HASH }}
+        path: integration
 
     - name: Free Disk Space (Ubuntu)
       uses: jlumbroso/free-disk-space@main
@@ -41,10 +47,10 @@ jobs:
         docker-images: true
         swap-storage: true
 
-    - name: Set up Python 3.11
+    - name: Set up Python 3.12
       uses: actions/setup-python@v3
       with:
-        python-version: "3.11"
+        python-version: "3.12"
 
     - name: Set up Poetry
       uses: abatilo/actions-poetry@v2
@@ -53,6 +59,7 @@ jobs:
 
     - name: Build Containers
       run: |
+        cd integration
         mkdir -p data/elastic/
         chmod -R 777 data/
         cp .env.integration .env
@@ -64,6 +71,7 @@ jobs:
 
     - name: Test integration with pytest
       run: |
+        cd integration
         poetry install --only dev
         poetry run playwright install --with-deps chromium
         poetry run pytest tests/ --browser chromium
@@ -73,7 +81,6 @@ jobs:
       uses: slackapi/slack-github-action@v1.24.0
       if: ${{ failure() && github.event_name == 'schedule' }}
       with:
-        channel-id: 'C05D67P6M34'
         payload: |
           {
             "text": "Scheduled Integration Tests Failed",
@@ -104,7 +111,7 @@ jobs:
             ]
           }
       env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_NOTIFICATIONS_TOKEN }}
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
     - name: notify slack pass
@@ -112,7 +119,6 @@ jobs:
       uses: slackapi/slack-github-action@v1.24.0
       if: ${{ success() && github.event_name == 'schedule' }}
       with:
-        channel-id: 'C05D67P6M34'
         payload: |
           {
             "text": "Scheduled Integration Tests Passed",
@@ -127,7 +133,7 @@ jobs:
             ]
           }
       env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_NOTIFICATIONS_TOKEN }}
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
     - name: Dump logs

@@ -106,8 +106,8 @@ module "django-app" {
   ip_whitelist                 = var.external_ips
   environment_variables        = local.django_app_environment_variables
   secrets                      = local.reconstructed_django_secrets
+  auto_scale_off_peak_times    = true
 }
-
 
 module "core_api" {
   service_discovery_service_arn = aws_service_discovery_service.service_discovery_service.arn
@@ -139,6 +139,8 @@ module "core_api" {
   ip_whitelist                 = var.external_ips
   environment_variables        = local.core_api_environment_variables
   secrets                      = local.reconstructed_core_secrets
+  ephemeral_storage            = 30
+  auto_scale_off_peak_times    = true
 }
 
 
@@ -154,7 +156,7 @@ module "worker" {
   ecs_cluster_id               = module.cluster.ecs_cluster_id
   ecs_cluster_name             = module.cluster.ecs_cluster_name
   autoscaling_minimum_target   = 1
-  autoscaling_maximum_target   = 10
+  autoscaling_maximum_target   = 1
   state_bucket                 = var.state_bucket
   vpc_id                       = data.terraform_remote_state.vpc.outputs.vpc_id
   private_subnets              = data.terraform_remote_state.vpc.outputs.private_subnets
@@ -165,6 +167,8 @@ module "worker" {
   environment_variables        = local.worker_environment_variables
   secrets                      = local.reconstructed_worker_secrets
   http_healthcheck             = false
+  ephemeral_storage            = 30
+  auto_scale_off_peak_times    = true
 }
 
 

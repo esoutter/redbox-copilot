@@ -34,30 +34,36 @@ rebuild: stop prune ## Rebuild all images
 
 .PHONY: test-core-api
 test-core-api: ## Test core-api
-	poetry install --no-root --no-ansi --with api,dev,ai --without worker,docs
-	poetry run pytest core_api/tests --cov=core_api/src -v --cov-report=term-missing --cov-fail-under=75
+	cd core-api && poetry install --with dev && poetry run python -m pytest  --cov=core_api -v --cov-report=term-missing --cov-fail-under=75
+
+.PHONY: test-ai
+test-ai: ## Test code with live LLM
+	cd redbox-core && poetry install --with dev && poetry run python -m pytest -m "ai" --cov=redbox -v --cov-report=term-missing --cov-fail-under=80
 
 .PHONY: test-redbox
 test-redbox: ## Test redbox
-	cp .env.test redbox-core/.env
-	cd redbox-core && poetry install && poetry run pytest --cov=redbox -v --cov-report=term-missing --cov-fail-under=80
+	cd redbox-core && poetry install && poetry run pytest -m "not ai" --cov=redbox -v --cov-report=term-missing --cov-fail-under=60
 
 .PHONY: test-worker
 test-worker: ## Test worker
-	poetry install --no-root --no-ansi --with worker,dev --without ai,api,docs
-	poetry run pytest worker/tests --cov=worker -v --cov-report=term-missing --cov-fail-under=40
+	cd worker && poetry install && poetry run pytest --cov=worker -v --cov-report=term-missing --cov-fail-under=80
 
 .PHONY: test-django
 test-django: stop ## Test django-app
 	docker compose up -d --wait db minio
 	docker compose run --no-deps django-app venv/bin/pytest tests/ --ds redbox_app.settings -v --cov=redbox_app.redbox_core --cov-fail-under 85 -o log_cli=true
 
+.PHONY: build-django-static
+build-django-static: ## Build django-app static files
+	cd django_app/frontend/ && npm install && npm run build
+	cd django_app/ && poetry run python manage.py collectstatic --noinput
+
 .PHONY: test-integration
 test-integration: rebuild run test-integration-without-build ## Run all integration tests
 
 .PHONY: test-integration-without-build
 test-integration-without-build : ## Run all integration tests without rebuilding
-	poetry install --no-root --no-ansi --with dev --without ai,api,worker,docs
+	poetry install --no-root --no-ansi --with dev --without docs
 	poetry run pytest tests/
 
 .PHONY: collect-static
@@ -78,13 +84,6 @@ format:  ## Format and fix code
 safe:  ##
 	poetry run bandit -ll -r ./redbox
 	poetry run bandit -ll -r ./django_app
-	poetry run mypy ./redbox --ignore-missing-imports
-	poetry run mypy ./django_app --ignore-missing-imports
-
-.PHONY: checktypes
-checktypes:  ## Check types in redbox and worker
-	poetry run mypy worker --ignore-missing-imports --no-incremental
-	cd redbox-core && poetry install && poetry run mypy . --ignore-missing-imports
 
 .PHONY: check-migrations
 check-migrations: stop  ## Check types in redbox and worker
@@ -97,6 +96,12 @@ check-migrations: stop  ## Check types in redbox and worker
 reset-db:  ## Reset Django database
 	docker compose down db --volumes
 	docker compose up -d db
+
+.PHONY: reset-elastic
+reset-elastic:  ## Reset Django database
+	docker compose down elasticsearch
+	rm -rf data/elastic/*
+	docker compose up -d elasticsearch --wait
 
 .PHONY: docs-serve
 docs-serve:  ## Build and serve documentation
@@ -129,12 +134,9 @@ AUTO_APPLY_RESOURCES = module.django-app.aws_ecs_task_definition.aws-ecs-task \
                        module.worker.aws_ecs_task_definition.aws-ecs-task \
                        module.worker.aws_ecs_service.aws-ecs-service \
                        module.worker.data.aws_ecs_task_definition.main \
-                       module.waf.aws_wafv2_ip_set.london \
                        aws_secretsmanager_secret.django-app-secret \
                        aws_secretsmanager_secret.worker-secret \
-                       aws_secretsmanager_secret.core-api-secret \
-					   module.load_balancer.aws_security_group_rule.load_balancer_http_whitelist \
-					   module.load_balancer.aws_security_group_rule.load_balancer_https_whitelist
+                       aws_secretsmanager_secret.core-api-secret
 
 target_modules = $(foreach resource,$(AUTO_APPLY_RESOURCES),-target $(resource))
 
@@ -181,10 +183,9 @@ docker_push:
 .PHONY: docker_update_tag
 docker_update_tag:
 	for service in django-app core-api worker; do \
-		MANIFEST=$$(aws ecr batch-get-image --repository-name $(ECR_REPO_NAME)-$$service --image-ids imageTag=$(IMAGE_TAG) --query 'images[].imageManifest' --output text) && \
-		aws ecr put-image --repository-name $(ECR_REPO_NAME)-$$service--image-tag $(tag) --image-manifest "$$MANIFEST"
+		MANIFEST=$$(aws ecr batch-get-image --repository-name $(ECR_REPO_NAME)-$$service --image-ids imageTag=$(IMAGE_TAG) --query 'images[].imageManifest' --output text) ; \
+		aws ecr put-image --repository-name $(ECR_REPO_NAME)-$$service --image-tag $(tag) --image-manifest "$$MANIFEST" ; \
 	done
-
 
 # Ouputs the value that you're after - useful to get a value i.e. IMAGE_TAG out of the Makefile
 .PHONY: docker_echo
@@ -216,7 +217,7 @@ tf_set_or_create_workspace:
 
 .PHONY: tf_init
 tf_init: ## Initialise terraform
-	terraform -chdir=./infrastructure/aws/$(instance) init -backend-config=$(TF_BACKEND_CONFIG) ${args} -reconfigure
+	terraform -chdir=./infrastructure/aws/$(instance) init -backend-config=$(TF_BACKEND_CONFIG) ${args}
 
 .PHONY: tf_plan
 tf_plan: ## Plan terraform
@@ -250,7 +251,7 @@ tf_destroy: ## Destroy terraform
 .PHONY: tf_import
 tf_import:
 	make tf_set_workspace && \
-	terraform -chdir=./infrastructure/aws/$(instance) import ${tf_build_args} -var-file=$(CONFIG_DIR)/${env}-input-params.tfvars ${name} ${id} 
+	terraform -chdir=./infrastructure/aws/$(instance) import ${tf_build_args} -var-file=$(CONFIG_DIR)/${env}-input-params.tfvars ${name} ${id}
 
 # Release commands to deploy your app to AWS
 .PHONY: release

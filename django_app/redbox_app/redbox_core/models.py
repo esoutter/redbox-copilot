@@ -1,10 +1,13 @@
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import override
 
 import boto3
 from botocore.config import Config
 from django.conf import settings
+from django.contrib.postgres.fields import ArrayField
+from django.core import validators
 from django.db import models
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -29,6 +32,12 @@ class TimeStampedModel(models.Model):
     class Meta:
         abstract = True
         ordering = ["created_at"]
+
+
+def sanitise_string(string: str | None) -> str | None:
+    """We are seeing NUL (0x00) characters in user entered fields, and also in document citations.
+    We can't save these characters, so we need to sanitise them."""
+    return string.replace("\x00", "\ufffd") if string else string
 
 
 class BusinessUnit(UUIDPrimaryKeyBase):
@@ -86,6 +95,25 @@ class User(BaseUser, UUIDPrimaryKeyBase):
         VET = "VET", _("Veterinary")
         OT = "OT", _("Other")
 
+    class AIExperienceLevel(models.TextChoices):
+        CURIOUS_NEWCOMER = "Curious Newcomer", _("I haven't used Generative AI tools")
+        CAUTIOUS_EXPLORER = "Cautious Explorer", _("I have a little experience using Generative AI tools")
+        ENTHUSIASTIC_EXPERIMENTER = (
+            "Enthusiastic Experimenter",
+            _("I occasionally use Generative AI tools but am still experimenting with their capabilities"),
+        )
+        EXPERIENCED_NAVIGATOR = (
+            "Experienced Navigator",
+            _("I use Generative AI tools regularly and have a good understanding of their strengths and limitations"),
+        )
+        AI_ALCHEMIST = (
+            "AI Alchemist",
+            _(
+                "I have extensive experience with Generative AI tools and can leverage them effectively in various "
+                "contexts"
+            ),
+        )
+
     username = None
     verified = models.BooleanField(default=False, blank=True, null=True)
     invited_at = models.DateTimeField(default=None, blank=True, null=True)
@@ -94,6 +122,8 @@ class User(BaseUser, UUIDPrimaryKeyBase):
     password = models.CharField("password", max_length=128, blank=True, null=True)
     business_unit = models.ForeignKey(BusinessUnit, null=True, blank=True, on_delete=models.SET_NULL)
     grade = models.CharField(null=True, blank=True, max_length=3, choices=UserGrade)
+    name = models.CharField(null=True, blank=True)
+    ai_experience = models.CharField(null=True, blank=True, max_length=25, choices=AIExperienceLevel)
     profession = models.CharField(null=True, blank=True, max_length=4, choices=Profession)
     objects = BaseUserManager()
 
@@ -121,6 +151,11 @@ class StatusEnum(models.TextChoices):
     unknown = "unknown"
     deleted = "deleted"
     errored = "errored"
+    processing = "processing"
+    failed = "failed"
+
+
+INACTIVE_STATUSES = [StatusEnum.deleted, StatusEnum.errored, StatusEnum.unknown]
 
 
 class File(UUIDPrimaryKeyBase, TimeStampedModel):
@@ -143,7 +178,8 @@ class File(UUIDPrimaryKeyBase, TimeStampedModel):
                 self.last_referenced = timezone.now()
         super().save(*args, **kwargs)
 
-    def delete(self, using=None, keep_parents=False):  # noqa: ARG002  # remove at Python 3.12
+    @override
+    def delete(self, using=None, keep_parents=False):
         #  Needed to make sure no orphaned files remain in the storage
         self.original_file.storage.delete(self.original_file.name)
         super().delete()
@@ -180,7 +216,7 @@ class File(UUIDPrimaryKeyBase, TimeStampedModel):
             return URL(url)
 
         if not self.original_file:
-            logger.error("attempt to access not existent file %s", self.pk)
+            logger.error("attempt to access non-existent file %s", self.pk, stack_info=True)
             return None
 
         return URL(self.original_file.url)
@@ -188,7 +224,10 @@ class File(UUIDPrimaryKeyBase, TimeStampedModel):
     @property
     def name(self) -> str:
         # User-facing name
-        return self.original_file_name or self.original_file.name
+        try:
+            return self.original_file_name or self.original_file.name
+        except ValueError as e:
+            logger.exception("attempt to access non-existent file %s", self.pk, exc_info=e)
 
     @property
     def unique_name(self) -> str:
@@ -223,6 +262,10 @@ class ChatHistory(UUIDPrimaryKeyBase, TimeStampedModel):
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.name} - {self.users}"
 
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
+        self.name = sanitise_string(self.name)
+        super().save(force_insert, force_update, using, update_fields)
+
 
 class ChatRoleEnum(models.TextChoices):
     ai = "ai"
@@ -234,9 +277,16 @@ class Citation(UUIDPrimaryKeyBase, TimeStampedModel):
     file = models.ForeignKey(File, on_delete=models.CASCADE)
     chat_message = models.ForeignKey("ChatMessage", on_delete=models.CASCADE)
     text = models.TextField(null=True, blank=True)
+    page_numbers = ArrayField(
+        models.PositiveIntegerField(), null=True, blank=True, help_text="location of citation in document"
+    )
 
     def __str__(self):
         return f"{self.file}: {self.text or ''}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
+        self.text = sanitise_string(self.text)
+        super().save(force_insert, force_update, using, update_fields)
 
 
 class ChatMessage(UUIDPrimaryKeyBase, TimeStampedModel):
@@ -244,14 +294,36 @@ class ChatMessage(UUIDPrimaryKeyBase, TimeStampedModel):
     text = models.TextField(max_length=32768, null=False, blank=False)
     role = models.CharField(choices=ChatRoleEnum.choices, null=False, blank=False)
     route = models.CharField(max_length=25, null=True, blank=True)
-    old_source_files = models.ManyToManyField(  # TODO (@gecBurton): delete me
-        # https://technologyprogramme.atlassian.net/browse/REDBOX-367
-        File,
-        related_name="chat_messages",
-        blank=True,
-    )
     selected_files = models.ManyToManyField(File, related_name="+", symmetrical=False, blank=True)
     source_files = models.ManyToManyField(File, through=Citation)
 
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.text} - {self.role}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
+        self.text = sanitise_string(self.text)
+        super().save(force_insert, force_update, using, update_fields)
+
+
+class ChatMessageRating(TimeStampedModel):
+    chat_message = models.OneToOneField(ChatMessage, on_delete=models.CASCADE, primary_key=True)
+    rating = models.PositiveIntegerField(validators=[validators.MinValueValidator(1), validators.MaxValueValidator(5)])
+    text = models.TextField(blank=True, null=True)
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"{self.chat_message} - {self.rating} - {self.text}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
+        self.text = sanitise_string(self.text)
+        super().save(force_insert, force_update, using, update_fields)
+
+
+class ChatMessageRatingChip(UUIDPrimaryKeyBase, TimeStampedModel):
+    rating = models.ForeignKey(ChatMessageRating, on_delete=models.CASCADE)
+    text = models.CharField(max_length=32)
+
+    class Meta:
+        unique_together = "rating", "text"
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"{self.rating} - {self.text}"

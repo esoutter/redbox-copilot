@@ -59,9 +59,21 @@ class CoreChatResponse:
 @dataclass_json(undefined=Undefined.EXCLUDE)
 @dataclass(frozen=True)
 class FileStatus:
-    processing_status: Literal[
-        "uploaded", "parsing", "chunking", "embedding", "indexing", "complete", "unknown", "errored"
-    ]
+    processing_status: (
+        Literal[
+            "uploaded",
+            "parsing",
+            "chunking",
+            "embedding",
+            "indexing",
+            "complete",
+            "unknown",
+            "errored",
+            "deleted",
+            "processing",
+        ]
+        | None
+    )
 
 
 @dataclass_json(undefined=Undefined.EXCLUDE)
@@ -112,5 +124,11 @@ class CoreApiClient:
     def delete_file(self, file_id: UUID, user: User) -> FileOperation:
         url = self.url / "file" / str(file_id)
         response = requests.delete(url, headers={"Authorization": user.get_bearer_token()}, timeout=60)
+        response.raise_for_status()
+        return FileOperation.schema().loads(response.content)
+
+    def reingest_file(self, file_id: UUID, user: User) -> FileOperation:
+        url = self.url / "file" / str(file_id)
+        response = requests.put(url, headers={"Authorization": user.get_bearer_token()}, timeout=60)
         response.raise_for_status()
         return FileOperation.schema().loads(response.content)

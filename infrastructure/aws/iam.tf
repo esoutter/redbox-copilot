@@ -1,4 +1,3 @@
-
 data "aws_iam_policy_document" "ecs_exec_role_policy" {
   # checkov:skip=CKV_AWS_111:Allow for write access without constraints
   # checkov:skip=CKV_AWS_356:Allow for policies to not have resource limits
@@ -31,7 +30,7 @@ data "aws_iam_policy_document" "ecs_exec_role_policy" {
        aws_secretsmanager_secret.worker-secret.arn,
        "${aws_secretsmanager_secret.worker-secret.arn}:*",
        aws_secretsmanager_secret.django-app-secret.arn,
-       "${aws_secretsmanager_secret.django-app-secret.arn}:*",
+       "${aws_secretsmanager_secret.django-app-secret.arn}:*"
     ]
   }
 
